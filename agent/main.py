@@ -1,6 +1,11 @@
 import requests
 import subprocess
 import re
+import platform
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from shared.log_db import log_command
 
 
 
@@ -16,21 +21,32 @@ CATEGORIES = {
     "📦 Package Install": ["install", "apt", "yum", "choco", "pip", "brew"],
 }
 SAFE_REPLACEMENTS = {
-    "rm -rf ~/.cache/*": (
-        "del /q /s %LOCALAPPDATA%\\Temp\\* 2>nul" 
-        if subprocess.os.name == "nt" else "rm -rf ~/.cache/*"
-    )
+    "Clear-Cache": "del /q /s %LOCALAPPDATA%\\Temp\\* 2>nul" ,
+    "Get-ChildItem DerivedData\\* -File | Remove-Item -Force": 'del /q /s %LOCALAPPDATA%\\Temp\\* 2>nul'
+                   if subprocess.os.name == "nt" else "rm -rf ~/.cache/*",
 }
 
 def clean_shell_output(text):
-    return re.sub(r"```(?:bash)?\n(.*?)```", r"\1", text, flags=re.DOTALL).strip()
+    # Remove any kind of Markdown-style code block
+    return re.sub(r"```(?:\w+)?\s*([\s\S]*?)\s*```", r"\1", text, flags=re.DOTALL).strip()
 
 def ask_llm(prompt, category):
     full_prompt = (
-        f"This is a {category.lower()} task.\n"
-        f"Convert this into a safe shell command:\n'{prompt}'\n"
-        f"Output only the command. No explanation or markdown."
+        f"Convert the following into a real, working Windows PowerShell command.\n"
+        f"Prompt: '{prompt}'\n"
+        f"Only respond with the raw PowerShell command — no explanations, no formatting.\n"
+        f"Task type: {category}\n"
+        f"Instruction: Convert this into a valid PowerShell command:\n'{prompt}'\n"
+        f"Requirements:\n"
+        f"- The command must run successfully on real Windows PowerShell.\n"
+        f"- DO NOT use imaginary commands like 'Clear-Cache'.\n"
+        f"- Always wrap full -Path or -Destination values in double quotes, including environment variables. Example:\n"
+        f'  New-Item -ItemType Directory -Path "$env:USERPROFILE\\Desktop\\resume"\n'
+        f"- Output only the single-line PowerShell command. No explanations, no Markdown, no code blocks."
+        f"- NEVER return imaginary commands like 'Clear-Cache' or 'Delete-Folder'. Only use real Windows PowerShell commands like 'Move-Item', 'Remove-Item', 'Get-ChildItem'.\n"
+
     )
+
     try:
         response = requests.post(OLLAMA_URL, json={
             "model": MODEL,
@@ -52,13 +68,69 @@ def ask_llm(prompt, category):
 def is_safe(command):
     return not any(term in command for term in BLOCKED)
 
-def run_shell(command):
+
+def run_shell(command, prompt="", category=""):
     try:
-        output = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT, text=True)
+        if platform.system() == "Windows":
+            if category == "📁 File/Folder Ops" and "move" in prompt.lower():
+                move_match = re.search(r"move\s+(.*?)\s+(?:from\s+(\w+)\s+)?to\s+(\w+)", prompt.lower())
+                if move_match:
+                    file_name = move_match.group(1).strip().strip('"')
+                    dest_folder = move_match.group(3)
+                else:
+                    file_name = dest_folder = None
+
+                if file_name and dest_folder:
+                    folder_map = {
+                        "downloads": "$env:USERPROFILE\\Downloads",
+                        "documents": "$env:USERPROFILE\\Documents",
+                        "desktop": "[Environment]::GetFolderPath('Desktop')"
+                    }
+
+                    # ✅ Inject this directly into PowerShell code
+                    destination_expr = folder_map.get(dest_folder.lower(), "[Environment]::GetFolderPath('Desktop')")
+
+                    # 🧠 Inline destination directly
+                    ps_script = f'''
+$filename = "{file_name}"
+$found = $null
+$folders = @(
+    "$env:USERPROFILE\\Downloads",
+    "$env:USERPROFILE\\Documents",
+    [Environment]::GetFolderPath("Desktop")
+)
+foreach ($folder in $folders) {{
+    $match = Get-ChildItem -Path $folder -Recurse -Filter $filename -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($match) {{
+        $found = $match.FullName
+        break
+    }}
+}}
+if ($found) {{
+    Write-Output "✅ Moving: $found"
+    Move-Item -Path $found -Destination $({destination_expr})
+}} else {{
+    Write-Output "❌ File not found."
+}}
+'''
+                    import base64
+                    encoded = base64.b64encode(ps_script.encode("utf-16le")).decode()
+                    command = f"powershell -NoLogo -NoProfile -EncodedCommand {encoded}"
+
+            else:
+                if not command.strip().lower().startswith("powershell"):
+                    command = f'powershell -Command "{command}"'
+
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT, text=True, shell=True)
         return output
+
     except subprocess.CalledProcessError as e:
         return e.output
-    
+
+
+
+
+
 def categorize(prompt):
     prompt_lower = prompt.lower()
     for category, keywords in CATEGORIES.items():
@@ -99,7 +171,24 @@ def main():
         confirm = input("Run this? (y/n): ")
         if confirm.lower() == "y":
             print("\n💻 Output:")
-            print(run_shell(shell_cmd))
+            result = run_shell(shell_cmd, prompt=prompt, category=category)
+            print(result)
+            log_command(
+                prompt=prompt,
+                category=category,
+                suggested_command=shell_cmd,
+                was_run=True,
+                output=result
+            )
+        else:
+            log_command(
+                prompt=prompt,
+                category=category,
+                suggested_command=shell_cmd,
+                was_run=False,
+                output=None
+            )
+
 
 if __name__ == "__main__":
     main()
